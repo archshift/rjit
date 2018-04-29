@@ -18,7 +18,7 @@ extern {
 
 type JitInstr<'a> = &'a [u8];
 
-struct JitPage {
+pub struct JitPage {
     page: &'static mut [u8],
     loop_pos: usize,
     prev_page: Option<Box<JitPage>>
@@ -28,7 +28,7 @@ impl JitPage {
     const PAGE_SIZE: usize = 0x10; // TODO: For testing that page "resizing" works
     const CODE_SIZE: usize = Self::PAGE_SIZE - 8;
 
-    fn map() -> Self {
+    pub fn map() -> Self {
         let slice = unsafe {
             let buf = libc::mmap(ptr::null_mut(), Self::PAGE_SIZE, libc::PROT_WRITE | libc::PROT_EXEC,
                                  libc::MAP_PRIVATE | libc::MAP_ANON, 0, 0) as *mut u8;
@@ -51,7 +51,9 @@ impl JitPage {
     }
 
     fn rel_to(&self, other_address: usize) -> i32 {
-        let out = (self.page.as_ptr() as usize - other_address) as isize;
+        let target_addr = self.page.as_ptr() as usize;
+        let src_addr = other_address;
+        let out = target_addr.wrapping_sub(src_addr) as isize;
         assert!(out >= (i32::min_value() as isize) && out <= (i32::max_value() as isize));
         out as i32
     }
@@ -60,7 +62,7 @@ impl JitPage {
         &self.page[pos] as *const u8 as usize
     }
 
-    fn push_instrs(mut self, instrs: &[JitInstr]) -> JitPage {
+    pub fn push_instrs(mut self, instrs: &[JitInstr]) -> JitPage {
         let mut copy_pos = self.loop_pos + 2;
 
         for (i, instr) in instrs.iter().enumerate() {
@@ -95,7 +97,7 @@ impl JitPage {
         }
     }
 
-    fn func(&self) -> extern fn() {
+    pub fn func(&self) -> extern fn() {
         return unsafe { mem::transmute(self.page.as_ptr()) };
     }
 }
@@ -108,7 +110,8 @@ impl Drop for JitPage {
     }
 }
 
-fn main() {
+#[test]
+fn test() {
     let mut page = JitPage::map();
     let func = page.func();
 
@@ -116,6 +119,7 @@ fn main() {
         let func: fn() -> u32 = unsafe { mem::transmute(func) };
         let out = func();
         let end_time = ::std::time::Instant::now();
+        assert!(out == 20);
         println!("Found {:08X}", out);
         println!("Exiting execution thread...");
         end_time

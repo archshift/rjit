@@ -47,7 +47,7 @@ impl JitPage {
 
     fn loop_pos(region_start: usize) -> usize {
         // Round up to the nearest word-aligned position
-        (region_start + 2) / 4 * 4
+        (region_start + 4) / 4 * 4
     }
 
     fn rel_to(&self, other_address: usize) -> i32 {
@@ -68,8 +68,7 @@ impl JitPage {
         for (i, instr) in instrs.iter().enumerate() {
             if copy_pos + instr.len() >= Self::CODE_SIZE {
                 let mut new_page = JitPage::map().push_instrs(&instrs[i..]);
-                let jmp_instr = JMP_REL(new_page.rel_to(self.address_at(Self::CODE_SIZE)));
-                self.page[Self::CODE_SIZE .. Self::CODE_SIZE + 5].copy_from_slice(&jmp_instr);
+                self.page[Self::CODE_SIZE + 2 .. Self::CODE_SIZE + 7].copy_from_slice(&jmp_instr);
 
                 self.break_loop();
                 self.loop_pos = Self::CODE_SIZE;

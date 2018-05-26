@@ -68,6 +68,7 @@ impl JitPage {
         for (i, instr) in instrs.iter().enumerate() {
             if copy_pos + instr.len() >= Self::CODE_SIZE {
                 let mut new_page = JitPage::map().push_instrs(&instrs[i..]);
+                let jmp_instr = JMP_REL(new_page.rel_to(self.address_at(Self::CODE_SIZE)));
                 self.page[Self::CODE_SIZE + 2 .. Self::CODE_SIZE + 7].copy_from_slice(&jmp_instr);
 
                 self.break_loop();
@@ -105,6 +106,10 @@ impl Drop for JitPage {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.page.as_mut_ptr() as *mut libc::c_void, Self::PAGE_SIZE);
+        }
+        // Manually drop the rest to avoid a stack overflow
+        while let Some(mut x) = self.prev_page.take() {
+            self.prev_page = x.prev_page.take();
         }
     }
 }

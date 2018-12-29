@@ -1,45 +1,51 @@
 extern crate libc;
 
 use std::mem;
-use std::ptr;
-use std::slice;
 use std::sync::atomic;
 
-const NOP: u8 = 0x90;
-const JMP_SELF: [u8; 2] = [0xEB, 0xFE];
-fn JMP_REL(rel: i32) -> [u8; 5] {
-    let rb: [u8; 4] = unsafe { mem::transmute(rel - 5) };
-    [0xe9, rb[0], rb[1], rb[2], rb[3]]
-}
+mod mmap;
+mod extfn;
+#[macro_use] pub mod x64asm;
+use crate::mmap::MemChunk;
+use crate::extfn::ExtFn;
 
 extern {
     fn atomic_write16(p: *mut u16, v: u16);
 }
 
-type JitInstr<'a> = &'a [u8];
+trait InstCopy {
+    #[inline]
+    fn instcopy<'a>(&mut self, src: impl Iterator<Item=&'a [u8]>);
+}
 
-pub struct JitPage {
-    page: &'static mut [u8],
+impl InstCopy for [u8] {
+    #[inline]
+    fn instcopy<'a>(&mut self, src: impl Iterator<Item=&'a [u8]>) {
+        let mut pos = 0;
+        for slice in src {
+            let end = pos + slice.len();
+            self[pos..end].copy_from_slice(slice);
+            pos = end;
+        }
+    }
+}
+
+struct JitPage {
+    page: MemChunk,
     loop_pos: usize,
     prev_page: Option<Box<JitPage>>
 }
 
 impl JitPage {
-    const PAGE_SIZE: usize = 0x10; // TODO: For testing that page "resizing" works
-    const CODE_SIZE: usize = Self::PAGE_SIZE - 8;
+    const CODE_SIZE: usize = MemChunk::PAGE_SIZE - 8;
 
     pub fn map() -> Self {
-        let slice = unsafe {
-            let buf = libc::mmap(ptr::null_mut(), Self::PAGE_SIZE, libc::PROT_WRITE | libc::PROT_EXEC,
-                                 libc::MAP_PRIVATE | libc::MAP_ANON, 0, 0) as *mut u8;
-            println!("Mapping JIT page at {:016X}!", buf as u64);
-            ptr::write_bytes(buf, NOP, Self::PAGE_SIZE);
-            slice::from_raw_parts_mut(buf, Self::PAGE_SIZE)
-        };
-        slice[..2].copy_from_slice(&JMP_SELF);
+        let mut page = MemChunk::filled(x64asm::opcode::NOP);
+        let self_jump = assemble!(jmp8 0 0);
+        page[..2].instcopy(self_jump);
 
         JitPage {
-            page: slice,
+            page: page,
             loop_pos: 0,
             prev_page: None
         }
@@ -50,63 +56,72 @@ impl JitPage {
         (region_start + 4) / 4 * 4
     }
 
-    fn rel_to(&self, other_address: usize) -> i32 {
-        let target_addr = self.page.as_ptr() as usize;
-        let src_addr = other_address;
-        let out = target_addr.wrapping_sub(src_addr) as isize;
-        assert!(out >= (i32::min_value() as isize) && out <= (i32::max_value() as isize));
-        out as i32
+    fn address_at(&self, pos: usize) -> *const u8 {
+        &self.page[pos] as *const u8
     }
 
-    fn address_at(&self, pos: usize) -> usize {
-        &self.page[pos] as *const u8 as usize
+    fn insert_jmp_bridge(&mut self, other: &JitPage) {
+        let dst_ptr = other.address_at(0) as usize;
+        let src_ptr = self.address_at(Self::CODE_SIZE) as usize;
+        
+        let jmp_instr = assemble!(jmp dst_ptr src_ptr);
+        self.page[Self::CODE_SIZE + 2 .. Self::CODE_SIZE + 7].instcopy(jmp_instr);
     }
 
-    pub fn push_instrs(mut self, instrs: &[JitInstr]) -> JitPage {
+    pub fn push_instrs<'a, T: Iterator<Item=&'a [u8]>>(mut self, mut instrs: T) -> JitPage {
         let mut copy_pos = self.loop_pos + 2;
 
-        for (i, instr) in instrs.iter().enumerate() {
-            if copy_pos + instr.len() >= Self::CODE_SIZE {
-                let mut new_page = JitPage::map().push_instrs(&instrs[i..]);
-                let jmp_instr = JMP_REL(new_page.rel_to(self.address_at(Self::CODE_SIZE)));
-                self.page[Self::CODE_SIZE + 2 .. Self::CODE_SIZE + 7].copy_from_slice(&jmp_instr);
+        let mut newpage_instr = None;
 
-                self.break_loop();
-                self.loop_pos = Self::CODE_SIZE;
-                new_page.prev_page = Some(Box::new(self));
-                return new_page;
+        while let Some(instr) = instrs.next() {
+            if copy_pos + instr.len() >= Self::CODE_SIZE {
+                newpage_instr = Some(instr);
+                break;
             }
             self.page[copy_pos .. copy_pos + instr.len()].copy_from_slice(instr);
             copy_pos += instr.len();
         }
 
-        let newloop_pos = Self::loop_pos(copy_pos);
-        self.page[newloop_pos .. newloop_pos + 2].copy_from_slice(&JMP_SELF);
-        self.break_loop();
-        self.loop_pos = newloop_pos;
-        self
+        if newpage_instr.is_some() {
+            let mut new_page = JitPage::map();
+            new_page = new_page.push_instrs(newpage_instr.iter().cloned());
+            new_page = new_page.push_instrs(instrs);
+            
+            self.insert_jmp_bridge(&new_page);
+            self.break_loop();
+
+            self.loop_pos = Self::CODE_SIZE;
+            new_page.prev_page = Some(Box::new(self));
+            new_page
+        } else {
+            let newloop_pos = Self::loop_pos(copy_pos);
+            let jmp_self = assemble!(jmp8 0 0);
+            self.page[newloop_pos .. newloop_pos + 2].instcopy(jmp_self);
+            self.break_loop();
+            self.loop_pos = newloop_pos;
+            self
+        }
     }
 
     fn break_loop(&mut self) {
         atomic::fence(atomic::Ordering::SeqCst);
-
-        let word_nop: u16 = unsafe { mem::transmute([NOP, NOP]) };
+        
+        let mut nops = [0u8; 2];
+        nops.instcopy(assemble!(nop; nop));
+        let word_nop: u16 = unsafe { mem::transmute(nops) };
         let loop_pos = self.loop_pos;
         unsafe {
             atomic_write16(&mut self.page[loop_pos] as *mut u8 as *mut u16, word_nop);
         }
     }
 
-    pub fn func(&self) -> extern fn() {
-        return unsafe { mem::transmute(self.page.as_ptr()) };
+    pub fn curr_addr(&self) -> usize {
+        self.address_at(self.loop_pos) as usize
     }
 }
 
 impl Drop for JitPage {
     fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.page.as_mut_ptr() as *mut libc::c_void, Self::PAGE_SIZE);
-        }
         // Manually drop the rest to avoid a stack overflow
         while let Some(mut x) = self.prev_page.take() {
             self.prev_page = x.prev_page.take();
@@ -114,39 +129,87 @@ impl Drop for JitPage {
     }
 }
 
+
+pub struct JitBuffer {
+    curr_page: JitPage
+}
+
+impl JitBuffer {
+    pub fn new() -> Self {
+        Self {
+            curr_page: JitPage::map()
+        }
+    }
+
+    pub fn push_instrs<'a, T: Iterator<Item=&'a [u8]>>(&mut self, instrs: T) {
+        let mut tmp = unsafe { mem::zeroed() };
+        mem::swap(&mut self.curr_page, &mut tmp);
+        tmp = tmp.push_instrs(instrs);
+        mem::swap(&mut self.curr_page, &mut tmp);
+        mem::forget(tmp);
+    }
+
+    pub fn start_func(&self) -> ExtFn {
+        ExtFn { ptr: self.curr_page.curr_addr() }
+    }
+}
+
+
+
 #[test]
 fn test() {
-    let mut page = JitPage::map();
-    let func = page.func();
+    use std::thread::spawn;
+    use std::sync::{Arc, Barrier};
+    let currtime = std::time::Instant::now;
+    let fence = || atomic::fence(atomic::Ordering::SeqCst);
 
-    let t = ::std::thread::spawn(move || {
-        let func: fn() -> u32 = unsafe { mem::transmute(func) };
+    let mut jit = JitBuffer::new();
+    let func = unsafe { jit.start_func().fn0::<u32>() };
+
+    let b1 = Arc::new(Barrier::new(2));
+    let b2 = b1.clone();
+
+    let t = spawn(move || {
+        b2.wait();
+    
         let out = func();
-        let end_time = ::std::time::Instant::now();
+        let end_time = currtime();
         assert!(out == 20);
-        println!("Found {:08X}", out);
-        println!("Exiting execution thread...");
         end_time
     });
 
-    ::std::thread::sleep_ms(10);
-    let start = ::std::time::Instant::now();
+    b1.wait();
+    fence();
+    let time = {
+        let start = currtime();
 
-    page = page.push_instrs(&[
-        &[0x48, 0x31, 0xc0], // xor eax, eax
-        &[0x48, 0x83, 0xc0, 0x14], // add eax, 20
-        &[0xc3] // ret
-    ]);
+        jit.push_instrs(assemble!(
+            rex_w; xor ax ax;
+            rex_w; addi ax 20;
+            ret
+        ));
 
-    let end = t.join().unwrap();
-    println!("Took {}ns", (end - start).subsec_nanos());
+        let end = t.join().unwrap();
+        (end - start).subsec_nanos()
+    };
+    fence();
 
-    ::std::thread::spawn(move || {
-        let func: fn() -> u32 = unsafe { mem::transmute(func) };
-        let start_time = ::std::time::Instant::now();
-        let out = func();
-        let end_time = ::std::time::Instant::now();
-        println!("Then took {}ns", (end_time - start_time).subsec_nanos());
-        assert!(out == 20);
+    spawn(move || {
+        println!("Took {}ns", time);
+
+        // Make sure func's in the icache
+        func();
+        fence();
+        let time = {
+            // Bench func
+            let start = currtime();
+            let out = func();
+            let end = currtime();
+            assert!(out == 20);
+            (end - start).subsec_nanos()
+        };
+        fence();
+
+        println!("Then took {}ns", time);
     }).join().unwrap();
 }

@@ -1,4 +1,3 @@
-#[macro_use]
 extern crate criterion;
 extern crate rjit;
 
@@ -6,7 +5,6 @@ use criterion::*;
 
 use rjit::*;
 use std::thread;
-use std::mem;
 use std::sync::mpsc::sync_channel;
 
 pub fn write_throughput(b: &mut Bencher) {
@@ -14,7 +12,6 @@ pub fn write_throughput(b: &mut Bencher) {
     let func = jit.start_func().f();
 
     let t = thread::spawn(move || {
-        let func: fn() -> u32 = unsafe { mem::transmute(func) };
         func();
     });
 

@@ -1,13 +1,29 @@
 use std::cell::Cell;
 
 pub mod opcode {
-    pub const XOR: u8   = 0x31;
-    pub const REX_W: u8 = 0x48;
-    pub const ARITH: u8 = 0x81;
-    pub const NOP: u8   = 0x90;
-    pub const RET: u8   = 0xC3;
-    pub const JMP: u8   = 0xE9;
-    pub const JMP8: u8  = 0xEB;
+    pub const ADD8: u8   = 0x00;
+    pub const ADD: u8    = 0x01;
+    pub const OR8: u8   = 0x08;
+    pub const OR: u8    = 0x09;
+    pub const ADC8: u8   = 0x10;
+    pub const ADC: u8    = 0x11;
+    pub const SBB8: u8   = 0x18;
+    pub const SBB: u8    = 0x19;
+    pub const AND8: u8   = 0x20;
+    pub const AND: u8    = 0x21;
+    pub const SUB8: u8   = 0x28;
+    pub const SUB: u8    = 0x29;
+    pub const XOR8: u8   = 0x30;
+    pub const XOR: u8    = 0x31;
+    pub const CMP8: u8   = 0x38;
+    pub const CMP: u8    = 0x39;
+    pub const REX_W: u8  = 0x48;
+    pub const ARITH8: u8 = 0x80;
+    pub const ARITH: u8  = 0x81;
+    pub const NOP: u8    = 0x90;
+    pub const RET: u8    = 0xC3;
+    pub const JMP: u8    = 0xE9;
+    pub const JMP8: u8   = 0xEB;
 
     pub enum ExtOp {
         Add = 0,
@@ -75,14 +91,58 @@ macro_rules! assemble_inner {
     }};
 }
 
-#[inline] pub fn xor(buf: &mut [u8], to: Register, with: Register) -> usize {
-    let rm = rm::regreg(to, with);
-    assemble_inner!(buf; XOR rm)
+macro_rules! def_arith {
+    ( $( $name:ident / $name8:ident: $op:ident / $op8:ident ),* ) => { $(
+        #[inline]
+        pub fn $name(buf: &mut [u8], to: Register, with: Register) -> usize {
+            let rm = rm::regreg(to, with);
+            assemble_inner!(buf; $op rm)
+        }
+
+        #[inline]
+        pub fn $name8(buf: &mut [u8], to: Register, with: Register) -> usize {
+            let rm = rm::regreg(to, with);
+            assemble_inner!(buf; $op8 rm)
+        }
+    )* }
 }
 
-#[inline] pub fn addi(buf: &mut [u8], to: Register, operand: u32) -> usize {
-    let rm = rm::extop(opcode::ExtOp::Add, to);
-    assemble_inner!(buf; ARITH rm operand)
+macro_rules! def_arith_imm {
+    ( $( $name:ident / $name8:ident: $op:ident ),* ) => { $(
+        #[inline]
+        pub fn $name(buf: &mut [u8], to: Register, operand: u32) -> usize {
+            let rm = rm::extop(opcode::ExtOp::$op, to);
+            assemble_inner!(buf; ARITH rm operand)
+        }
+
+        #[inline]
+        pub fn $name8(buf: &mut [u8], to: Register, operand: u8) -> usize {
+            let rm = rm::extop(opcode::ExtOp::$op, to);
+            assemble_inner!(buf; ARITH8 rm operand)
+        }
+    )* }
+}
+
+def_arith! {
+    adc/adc8: ADC/ADC8,
+    add/add8: ADD/ADD8,
+    and/and8: AND/AND8,
+    cmp/cmp8: CMP/CMP8,
+    or/or8:   OR/OR8,
+    sbb/sbb8: SBB/SBB8,
+    sub/sub8: SUB/SUB8,
+    xor/xor8: XOR/XOR8
+}
+
+def_arith_imm! {
+    adci/adc8i: Adc,
+    addi/add8i: Add,
+    andi/and8i: And,
+    cmpi/cmp8i: Cmp,
+    ori /or8i:  Or,
+    sbbi/sbb8i: Sbb,
+    subi/sub8i: Sub,
+    xori/xor8i: Xor
 }
 
 #[inline] pub fn jmp(buf: &mut [u8], to: usize, from: usize) -> usize {
